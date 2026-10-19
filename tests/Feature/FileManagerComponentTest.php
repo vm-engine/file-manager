@@ -1,0 +1,531 @@
+<?php
+
+declare(strict_types=1);
+
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Storage;
+use Livewire\Livewire;
+use VmEngine\FileManager\Contracts\FmAuthorizer;
+use VmEngine\FileManager\Models\FmFile;
+
+beforeEach(function () {
+    Storage::fake('public');
+
+    pinFmConfig();
+
+    // Super-admin for the default (gate) driver; the spatie tests below ignore gates.
+    Gate::before(fn (): bool => true);
+    $this->user = fmUser();
+
+    $this->makeFile = function (string $relativePath, int $size = 1, bool $trashed = false): FmFile {
+        Storage::disk('public')->put('fm/public/'.$relativePath, 'x');
+
+        return FmFile::create([
+            'disk' => 'public',
+            'folder_path' => 'fm/public',
+            'relative_path' => $relativePath,
+            'filename' => basename($relativePath),
+            'original_name' => basename($relativePath),
+            'extension' => pathinfo($relativePath, PATHINFO_EXTENSION),
+            'mime_type' => 'application/pdf',
+            'size' => $size,
+            'has_thumbnail' => false,
+            'is_trashed' => $trashed,
+            'trashed_at' => $trashed ? now() : null,
+        ]);
+    };
+
+    $this->file = ($this->makeFile)('report.pdf');
+});
+
+// --- rendering -----------------------------------------------------------
+
+it('renders the fm shell without the old move modal', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertOk()
+        ->assertSeeHtml('pageName: &quot;File Manager&quot;')
+        ->assertSeeHtml('class="fm"')
+        ->assertSeeHtml('fmBrowser(')
+        ->assertSeeHtml('fm-toolbar')
+        ->assertSeeHtml('data-fm-item')
+        ->assertSeeHtml('open-modal-fm-rename')
+        ->assertDontSeeHtml('open-modal-fm-move')
+        ->assertDontSeeHtml('syn-file-tile');
+});
+
+// --- rename / new folder (kept behaviour) --------------------------------
+
+it('opens the rename modal via the package modal event', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('startRename', $this->file->id)
+        ->assertSet('renameName', 'report.pdf')
+        ->assertDispatched('open-modal-fm-rename');
+});
+
+it('closes the rename modal after renaming', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('startRename', $this->file->id)
+        ->set('renameName', 'renamed.pdf')
+        ->call('confirmRename')
+        ->assertDispatched('close-modal-fm-rename');
+
+    expect($this->file->fresh()->filename)->toBe('renamed.pdf');
+});
+
+it('creates a folder in the current folder by default', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('newFolderName', 'docs')
+        ->call('createFolder')
+        ->assertDispatched('close-modal-fm-new-folder');
+
+    Storage::disk('public')->assertExists('fm/public/docs');
+});
+
+it('creates a folder inside the folder chosen from the context menu', function () {
+    Storage::disk('public')->makeDirectory('fm/public/docs');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('newFolderParent', 'docs')
+        ->set('newFolderName', 'y2026')
+        ->call('createFolder')
+        ->assertSet('newFolderParent', null);
+
+    Storage::disk('public')->assertExists('fm/public/docs/y2026');
+});
+
+it('refuses an unsafe new-folder parent', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('newFolderParent', '../escape')
+        ->set('newFolderName', 'x')
+        ->call('createFolder');
+
+    Storage::disk('public')->assertMissing('fm/escape/x');
+});
+
+// --- selection -----------------------------------------------------------
+
+it('selects files and folders exclusively or additively', function () {
+    Storage::disk('public')->makeDirectory('fm/public/docs');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('selectOnly', 'file', (string) $this->file->id)
+        ->assertSet('selected', [$this->file->id])
+        ->assertSet('selectedDirs', [])
+        ->call('toggleSelect', 'dir', 'docs')
+        ->assertSet('selectedDirs', ['docs'])
+        ->call('selectOnly', 'dir', 'docs')
+        ->assertSet('selected', [])
+        ->assertSet('selectedDirs', ['docs'])
+        ->call('clearSelection')
+        ->assertSet('selectedDirs', []);
+});
+
+it('summarises the selection with total size and a single-file shortcut', function () {
+    $second = ($this->makeFile)('brief.pdf', 2000);
+    $this->file->update(['size' => 1000]);
+
+    $component = Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('selected', [$this->file->id, $second->id]);
+
+    $summary = $component->instance()->selectionSummary;
+    expect($summary['files'])->toBe(2)
+        ->and($summary['bytes'])->toBe(3000)
+        ->and($summary['single'])->toBeNull();
+
+    $component->set('selected', [$second->id]);
+    expect($component->instance()->selectionSummary['single']->id)->toBe($second->id);
+});
+
+// --- clipboard -----------------------------------------------------------
+
+it('copies then pastes a duplicate into another folder', function () {
+    Storage::disk('public')->makeDirectory('fm/public/archive');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('selectOnly', 'file', (string) $this->file->id)
+        ->call('clipboardCopy')
+        ->assertSet('clipboard.mode', 'copy')
+        ->call('paste', 'archive')
+        ->assertSet('clipboard.files', [$this->file->id]);
+
+    expect(FmFile::count())->toBe(2)
+        ->and(FmFile::where('relative_path', 'archive/report.pdf')->exists())->toBeTrue()
+        ->and($this->file->fresh()->relative_path)->toBe('report.pdf');
+});
+
+it('cuts then pastes a move and clears the clipboard', function () {
+    Storage::disk('public')->makeDirectory('fm/public/archive');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('selectOnly', 'file', (string) $this->file->id)
+        ->call('clipboardCut')
+        ->call('paste', 'archive')
+        ->assertSet('clipboard.files', []);
+
+    expect(FmFile::count())->toBe(1)
+        ->and($this->file->fresh()->relative_path)->toBe('archive/report.pdf');
+});
+
+it('treats cut and paste into the same folder as a no-op', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('selectOnly', 'file', (string) $this->file->id)
+        ->call('clipboardCut')
+        ->call('paste')
+        ->assertSet('clipboard.files', []);
+
+    expect($this->file->fresh()->filename)->toBe('report.pdf')
+        ->and(FmFile::count())->toBe(1);
+});
+
+it('keeps the clipboard while navigating', function () {
+    Storage::disk('public')->makeDirectory('fm/public/archive');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('selectOnly', 'file', (string) $this->file->id)
+        ->call('clipboardCopy')
+        ->call('navigateTo', 'archive')
+        ->assertSet('subPath', 'archive')
+        ->assertSet('clipboard.files', [$this->file->id]);
+});
+
+it('refuses to paste into an unsafe target', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('selectOnly', 'file', (string) $this->file->id)
+        ->call('clipboardCopy')
+        ->call('paste', '../outside');
+
+    expect(FmFile::count())->toBe(1);
+});
+
+it('refuses to paste without copy permission', function () {
+    pinFmConfig(['read']);
+    Storage::disk('public')->makeDirectory('fm/public/archive');
+    config()->set('filemanager.authorizer', 'spatie');
+    app()->forgetInstance(FmAuthorizer::class);
+    $admin = fmUser(['admin']);
+
+    Livewire::actingAs($admin)->test('filemanager::file-manager')
+        ->set('selected', [$this->file->id])
+        ->set('clipboard', ['mode' => 'copy', 'files' => [$this->file->id]])
+        ->call('paste', 'archive')
+        ->assertDispatched('fm-notify');
+
+    expect(FmFile::count())->toBe(1);
+});
+
+// --- tree + navigation ---------------------------------------------------
+
+it('lists the tree lazily and toggles nodes', function () {
+    Storage::disk('public')->makeDirectory('fm/public/a/b/c');
+    Storage::disk('public')->makeDirectory('fm/public/z');
+
+    $component = Livewire::actingAs($this->user)->test('filemanager::file-manager');
+    $tree = $component->instance()->folderTree;
+
+    expect(array_column($tree, 'name'))->toBe(['a', 'z'])
+        ->and($tree[0]['children'])->toBeNull();
+
+    $component->call('toggleNode', 'a');
+    $tree = $component->instance()->folderTree;
+    expect($tree[0]['open'])->toBeTrue()
+        ->and(array_column($tree[0]['children'], 'name'))->toBe(['b']);
+
+    $component->call('toggleNode', 'a/b')->call('toggleNode', 'a')
+        ->assertSet('expanded', []);
+});
+
+it('expands the current folder and its ancestors when navigating', function () {
+    Storage::disk('public')->makeDirectory('fm/public/a/b');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('navigateTo', 'a/b')
+        ->assertSet('subPath', 'a/b')
+        ->assertSet('expanded', ['a', 'a/b']);
+});
+
+it('ignores traversal and missing folders when navigating', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('navigateTo', '../secret')
+        ->assertSet('subPath', '')
+        ->call('navigateTo', 'missing')
+        ->assertSet('subPath', '');
+
+    Storage::disk('public')->assertMissing('fm/public/missing');
+});
+
+it('remembers the last folder and expands only its ancestors on return', function () {
+    Storage::disk('public')->makeDirectory('fm/public/a/b');
+    Storage::disk('public')->makeDirectory('fm/public/z');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('toggleNode', 'z')
+        ->call('navigateTo', 'a/b');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSet('subPath', 'a/b')
+        ->assertSet('expanded', ['a', 'a/b']);
+});
+
+it('falls back to the root when the remembered folder is gone', function () {
+    Storage::disk('public')->makeDirectory('fm/public/a/b');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')->call('navigateTo', 'a/b');
+    Storage::disk('public')->deleteDirectory('fm/public/a');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSet('subPath', '')
+        ->assertSet('expanded', []);
+});
+
+// --- trash + details -----------------------------------------------------
+
+it('lists all trashed files of the storage in trash view', function () {
+    ($this->makeFile)('docs/old.pdf', 1, true);
+    ($this->makeFile)('gone.pdf', 1, true);
+
+    $component = Livewire::actingAs($this->user)->test('filemanager::file-manager')->call('toggleTrash');
+
+    expect(array_column($component->instance()->items, 'name'))->toBe(['gone.pdf', 'old.pdf']);
+});
+
+it('opens and closes the details drawer', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('showDetails', $this->file->id)
+        ->assertSet('detailsId', $this->file->id)
+        ->assertSet('selected', [$this->file->id])
+        ->assertSeeHtml('fm-drawer')
+        ->call('closeDetails')
+        ->assertSet('detailsId', null);
+});
+
+it('lists folders before files', function () {
+    Storage::disk('public')->makeDirectory('fm/public/docs');
+
+    $items = Livewire::actingAs($this->user)->test('filemanager::file-manager')->instance()->items;
+
+    expect(array_column($items, 'kind'))->toBe(['dir', 'file']);
+});
+
+it('shows a not-configured state instead of the disk root when no storage exists', function () {
+    config()->set('filemanager.folders', []);
+    Storage::disk('public')->makeDirectory('other-module');
+
+    $component = Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSee(__('filemanager::labels.not_configured'))
+        ->assertDontSeeHtml('data-fm-item');
+
+    expect($component->instance()->items)->toBe([]);
+});
+
+it('ignores id-based actions on files outside the current storage root', function () {
+    $foreign = FmFile::create([
+        'disk' => 'public', 'folder_path' => 'fm/other', 'relative_path' => 'secret.pdf',
+        'filename' => 'secret.pdf', 'original_name' => 'secret.pdf', 'extension' => 'pdf',
+        'mime_type' => 'application/pdf', 'size' => 1, 'is_trashed' => false,
+    ]);
+
+    $component = Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('trash', $foreign->id)
+        ->call('startRename', $foreign->id)
+        ->assertNotDispatched('open-modal-fm-rename')
+        ->set('selected', [$foreign->id])
+        ->call('trashSelected')
+        ->set('detailsId', $foreign->id);
+
+    expect($foreign->fresh()->is_trashed)->toBeFalse()
+        ->and($component->instance()->detailsFile)->toBeNull();
+
+    $component->set('selected', [$foreign->id])->call('purgeSelected');
+    expect(FmFile::find($foreign->id))->not->toBeNull();
+});
+
+// --- search --------------------------------------------------------------
+
+it('searches subfolders and shows where each result lives', function () {
+    ($this->makeFile)('docs/2024/report-q1.pdf');
+    Storage::disk('public')->makeDirectory('fm/public/archive/reports');
+
+    $component = Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('search', 'report')
+        ->assertSee(__('filemanager::labels.in_location', ['path' => 'docs/2024']))
+        ->assertSee(__('filemanager::labels.in_location', ['path' => 'archive']))
+        ->assertDontSee(__('filemanager::labels.search_truncated', ['count' => 100]));
+
+    expect(array_column($component->instance()->items, 'key'))
+        ->toContain('archive/reports')
+        ->and(array_column($component->instance()->items, 'name'))->toContain('report-q1.pdf', 'report.pdf');
+});
+
+it('asks to refine the search when results are capped', function () {
+    foreach (range(1, 101) as $i) {
+        ($this->makeFile)("bulk/hit-{$i}.pdf");
+    }
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('search', 'hit')
+        ->assertSee(__('filemanager::labels.search_truncated', ['count' => 100]));
+});
+
+// --- browser-rendered thumbnails -----------------------------------------
+
+function fmJpegDataUrl(): string
+{
+    $fake = UploadedFile::fake()->image('t.jpg', 100, 140);
+
+    return 'data:image/jpeg;base64,'.base64_encode((string) file_get_contents($fake->getPathname()));
+}
+
+it('stores a browser-rendered thumbnail and renders it', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSeeHtml('data-fm-thumb="pdf"')
+        ->call('storeThumbnail', $this->file->id, fmJpegDataUrl())
+        ->assertDontSeeHtml('data-fm-thumb="pdf"')
+        ->assertSeeHtml('report.pdf_thumb.jpg');
+
+    expect($this->file->fresh()->has_thumbnail)->toBeTrue();
+});
+
+it('refuses thumbnails for files outside the browsed root', function () {
+    $foreign = FmFile::create([
+        'disk' => 'public', 'folder_path' => 'fm/other', 'relative_path' => 'secret.pdf',
+        'filename' => 'secret.pdf', 'original_name' => 'secret.pdf', 'extension' => 'pdf',
+        'mime_type' => 'application/pdf', 'size' => 1, 'is_trashed' => false,
+    ]);
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('storeThumbnail', $foreign->id, fmJpegDataUrl());
+
+    expect($foreign->fresh()->has_thumbnail)->toBeFalse();
+});
+
+it('refuses thumbnails for trashed files', function () {
+    $trashed = ($this->makeFile)('old.pdf', 1, true);
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('storeThumbnail', $trashed->id, fmJpegDataUrl());
+
+    expect($trashed->fresh()->has_thumbnail)->toBeFalse();
+});
+
+it('passes thumbnail settings and pdf.js urls to the browser', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSeeHtml('pdf.min.mjs')
+        ->assertSeeHtml('pdf.worker.min.mjs');
+});
+
+// --- viewer --------------------------------------------------------------
+
+it('renders the fm viewer instead of a lightbox', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSeeHtml('data-fm-viewer')
+        ->assertSeeHtml('data-fm-viewer-pages')
+        ->assertDontSeeHtml('open-lightbox-fm-preview')
+        ->assertDontSeeHtml('syn-lightbox');
+});
+
+it('marks pdfs as previewable', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSeeHtml('data-preview="pdf"');
+});
+
+it('shows the stored pdf thumbnail in the details drawer', function () {
+    $this->file->update(['has_thumbnail' => true]);
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('showDetails', $this->file->id)
+        ->assertSeeHtml('report.pdf_thumb.jpg" alt="report.pdf"');
+});
+
+// --- compress --------------------------------------------------------------
+
+it('compresses the selection into a zip in the current folder', function () {
+    ($this->makeFile)('docs/inner.pdf');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('selected', [$this->file->id])
+        ->set('selectedDirs', ['docs'])
+        ->call('compressSelected')
+        ->assertSet('selected', [])
+        ->assertSet('selectedDirs', [])
+        ->assertDispatched('fm-notify', variant: 'success');
+
+    $zip = FmFile::where('extension', 'zip')->sole();
+    expect($zip->relative_path)->toBe('archive.zip');
+    Storage::disk('public')->assertExists('fm/public/archive.zip');
+});
+
+it('refuses to compress without upload permission', function () {
+    pinFmConfig(['read', 'copy']);
+    config()->set('filemanager.authorizer', 'spatie');
+    app()->forgetInstance(FmAuthorizer::class);
+    $admin = fmUser(['admin']);
+
+    Livewire::actingAs($admin)->test('filemanager::file-manager')
+        ->set('selected', [$this->file->id])
+        ->call('compressSelected')
+        ->assertDispatched('fm-notify', variant: 'danger');
+
+    expect(FmFile::where('extension', 'zip')->exists())->toBeFalse();
+});
+
+it('warns when the selection has nothing to compress', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->set('selectedDirs', ['empty'])
+        ->call('compressSelected')
+        ->assertDispatched('fm-notify', variant: 'warning');
+
+    expect(FmFile::where('extension', 'zip')->exists())->toBeFalse();
+});
+
+it('shows compress actions only with upload permission', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSeeHtml('menuCompress()');
+
+    pinFmConfig(['read']);
+    config()->set('filemanager.authorizer', 'spatie');
+    app()->forgetInstance(FmAuthorizer::class);
+    $admin = fmUser(['admin']);
+
+    Livewire::actingAs($admin)->test('filemanager::file-manager')
+        ->assertDontSeeHtml('menuCompress()');
+});
+
+// --- standalone shell -----------------------------------------------------
+
+it('renders the package heading, confirm dialog and toasts instead of synapse ui', function () {
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSeeHtml('fm-page-title')
+        ->assertSeeHtml('fmConfirm(')
+        ->assertSeeHtml('fmToasts')
+        ->assertSeeHtml('fmModal(')
+        ->assertDontSeeHtml('syn-modal');
+});
+
+it('remembers the browsing position across visits', function () {
+    Storage::disk('public')->makeDirectory('fm/public/archive');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->call('navigateTo', 'archive')
+        ->set('viewMode', 'list');
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSet('subPath', 'archive')
+        ->assertSet('viewMode', 'list');
+});
+
+it('drops a remembered sub-folder that no longer exists', function () {
+    session(['filemanager.position' => ['currentFolder' => 'fm/public', 'subPath' => 'gone', 'viewMode' => 'grid', 'sortBy' => 'filename', 'sortDir' => 'asc']]);
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSet('subPath', '');
+});
+
+it('renders no unresolved blade directives in an empty folder', function () {
+    $this->file->delete();
+
+    Livewire::actingAs($this->user)->test('filemanager::file-manager')
+        ->assertSee(__('filemanager::labels.folder_empty'))
+        ->assertDontSeeHtml('@canAccess')
+        ->assertDontSeeHtml('@endcanAccess');
+});

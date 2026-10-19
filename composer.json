@@ -1,0 +1,53 @@
+{
+    "name": "vm-engine/file-manager",
+    "description": "Standalone Livewire file manager for Laravel: browse, upload, trash, thumbnails, PDF viewer, per-folder ACL, form file picker, TinyMCE and Jodit integration",
+    "keywords": ["laravel", "livewire", "file-manager", "file-picker", "tinymce", "jodit"],
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Achmad Ardiansyah",
+            "email": "achmad.ardiansyah@4visionmedia.com"
+        }
+    ],
+    "require": {
+        "php": "^8.5",
+        "laravel/framework": "^13.0",
+        "livewire/livewire": "^4.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^11.0",
+        "pestphp/pest": "^5.0",
+        "larastan/larastan": "^3.0",
+        "laravel/pint": "^1.0"
+    },
+    "suggest": {
+        "spatie/laravel-permission": "Required for the 'spatie' authorizer driver (per-folder role map)",
+        "laravel/sanctum": "Required for the optional API routes (filemanager.api.enabled)"
+    },
+    "autoload": {
+        "psr-4": {
+            "VmEngine\\FileManager\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "VmEngine\\FileManager\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "VmEngine\\FileManager\\FileManagerServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        },
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

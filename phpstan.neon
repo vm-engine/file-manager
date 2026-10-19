@@ -1,0 +1,11 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+# Livewire MFC classes (resources/views/livewire/*/*.php) are anonymous
+# classes whose #[Computed] properties and view() are runtime magic larastan
+# can't see, so only src/ is analysed (same as the original synmod-fm).
+parameters:
+    level: 7
+    paths:
+        - src
+    tmpDir: build/phpstan
